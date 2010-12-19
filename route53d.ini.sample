@@ -1,0 +1,36 @@
+[server]
+# The number of worker children to spawn
+processes = 5
+
+# Set to 1 to disable calling the Route 53 API
+dry-run = 0
+
+# IP address and port to listen on. At the moment there is NO AUTHENTICATION
+# in route53d so ensure access to the IP/port are sufficiently restricted.
+listen_ip = 127.0.0.1
+listen_port = 1053
+
+# Switch to this user after binding the socket. This is required if started
+# as root. Has no effect if not started as root.
+username = some_user
+
+
+[kludge]
+# Ugly kludge alert!
+# A dynamic update DNS message specifying a record deletion does not include the
+# record TTL, but that's required for the DELETE API Change request. I have a plan
+# for a workaround but in the meantime the TTL in DELETE calls will be set to this
+# value. Set this to the TTL value you use when you create your records or the DELETE
+# calls will fail.
+delete_ttl = 900
+
+
+[hostedzone]
+#
+# Enumerate the zone IDs for each hosted zone. e.g.
+#    [hostedzone]
+#    foo.com = Z35M1DXIV1SK14
+#    baz.org = Z27HFGY546JU76
+#
+
+

@@ -1,0 +1,97 @@
+INTRODUCTION
+
+route53d is a DNS frontend to the Amazon Route 53 API. It allows you to
+use standard DNS tools to make changes to your Route 53 zones. At the
+moment it supports adding and deleting resource records by dynamic
+update (e.g with nsupdate).
+
+Support for slaving from your master DNS server by incremental zone
+transfer (IXFR) and pushing zones changes to the API is nearly complete.
+
+
+REQUIREMENTS
+
+ + Python
+   http://www.python.org/
+ + boto
+   https://github.com/boto/boto
+   Route 53 support isn't yet in a Boto release. Take a source snapshot
+   from Github.
+ + dnspython
+   http://www.dnspython.org/
+ + An active Amazon Route53 account
+   http://aws.amazon.com/route53/
+ + AWS access keys
+   http://aws.amazon.com/iam/faqs/
+   http://aws.typepad.com/aws/2010/12/dns30-a-visual-tool-for-amazon-route-53.html
+
+
+INSTALLATION
+
+1. Install Python, dnspython and Boto according to their documentation.
+   This may help: http://aws.amazon.com/articles/3998
+2. route53d uses Boto to call the Route53 API. Configure Boto with your
+   AWS access key: http://code.google.com/p/boto/wiki/BotoConfig
+3. Create a config file. Use route53d.ini.sample as teh starting point.
+4. Start the daemon:  route53d.py [--config /path/to/route53d.ini]
+
+
+LIMITATIONS
+
+ + Resource-record deletion
+   The DNS dynamic update mechanism allows deletion of 1) a specific
+   resource-record, 2) a resource-record set, or 3) deletion of all
+   records belonging to a name. The Route 53 API implements only
+   specific resource-record deletion so route53d will reject requests
+   for the other deletion types.
+
+
+BUGS!
+
+Definitely. Email me with bug reports, debug logs, and patches: james@now.ie
+
+
+FUTURE WORK
+
+Started:
+
+ + IXFR
+   React to a NOTIFY message, use IXFR to fetch incremental changes from
+   an upstream DNS server, push each zone increment as one API call.
+   Status: 80% complete.
+ + Answer SOA queries for IXFR slave zones
+   Respond with the current SOA for a zone that is slaved via IXFR to
+   allow DNS based monitoring of API update progess.
+   Status: 40% complete.
+
+Not yet started:
+
+ + Remove the deletion TTL kludge
+   Need to be able to populate record TTLs in API delete calls. Query
+   from DNS? Very non-atomic ...
+ + Use the ListHostedZones API call at startup instead of configuring
+   each HostedZone ID in the config file. For the moment I want the
+   script to only mess with zones that have been specifically marked as
+   safe to play with.
+ + AXFR
+   An upstream server responding to IXFR can require the client to
+   fallback to AXFR.
+ + Authentication
+   Authenticate dynamic updates, notifies and IXFR/AXFR by TSIG. Maybe
+   support authorisation by IP address.
+ + Pending change polling
+   Maintain a queue of pending changes and poll the API asynchronously
+   to log when a change is complete.
+ + Review the process model
+   It's a bit clunky. When the script internals settle down should see
+   if there's a more appropriate way to split up the work.
+ + Cleanly handle API limits
+   Code for the maximum number of changes per call (1000) and maximum
+   amount of record data (32000B) per call
+
+
+LICENSE
+
+This software is released under a 3-clause BSD licence. The licence
+text is in the script.
+
