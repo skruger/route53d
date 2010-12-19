@@ -32,7 +32,7 @@ INSTALLATION
    This may help: http://aws.amazon.com/articles/3998
 2. route53d uses Boto to call the Route53 API. Configure Boto with your
    AWS access key: http://code.google.com/p/boto/wiki/BotoConfig
-3. Create a config file. Use route53d.ini.sample as teh starting point.
+3. Create a config file. Use route53d.ini.sample as the starting point.
 4. Start the daemon:  route53d.py [--config /path/to/route53d.ini]
 
 
@@ -53,41 +53,7 @@ Definitely. Email me with bug reports, debug logs, and patches: james@now.ie
 
 FUTURE WORK
 
-Started:
-
- + IXFR
-   React to a NOTIFY message, use IXFR to fetch incremental changes from
-   an upstream DNS server, push each zone increment as one API call.
-   Status: 80% complete.
- + Answer SOA queries for IXFR slave zones
-   Respond with the current SOA for a zone that is slaved via IXFR to
-   allow DNS based monitoring of API update progess.
-   Status: 40% complete.
-
-Not yet started:
-
- + Remove the deletion TTL kludge
-   Need to be able to populate record TTLs in API delete calls. Query
-   from DNS? Very non-atomic ...
- + Use the ListHostedZones API call at startup instead of configuring
-   each HostedZone ID in the config file. For the moment I want the
-   script to only mess with zones that have been specifically marked as
-   safe to play with.
- + AXFR
-   An upstream server responding to IXFR can require the client to
-   fallback to AXFR.
- + Authentication
-   Authenticate dynamic updates, notifies and IXFR/AXFR by TSIG. Maybe
-   support authorisation by IP address.
- + Pending change polling
-   Maintain a queue of pending changes and poll the API asynchronously
-   to log when a change is complete.
- + Review the process model
-   It's a bit clunky. When the script internals settle down should see
-   if there's a more appropriate way to split up the work.
- + Cleanly handle API limits
-   Code for the maximum number of changes per call (1000) and maximum
-   amount of record data (32000B) per call
+See http://code.google.com/p/route53d/wiki/TODO
 
 
 LICENSE
