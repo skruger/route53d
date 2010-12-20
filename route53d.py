@@ -32,6 +32,7 @@
 import signal
 import logging
 import select
+import socket
 import sys
 import os
 import pwd
@@ -40,92 +41,95 @@ import ConfigParser
 import binascii
 import struct
 from optparse import OptionParser
-from multiprocessing import Process, current_process
+from multiprocessing import Process
 from types import *
 import dns.message
 import dns.query
-import dns.zone
 import dns.rdatatype
 import boto.route53
 
 #############################################################################
 
-class Route53HostedZoneRequest:
+class Route53HostedZoneRequest(object):
 
-    Route53APIXMLRRSetChangeHeader = """
-      <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2010-10-01/">
-       <ChangeBatch>
-    """
+    Route53APIXMLRRSetChangeHeader = \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<ChangeResourceRecordSetsRequest ' \
+        'xmlns="https://route53.amazonaws.com/doc/2010-10-01/">' \
+        '<ChangeBatch>'
 
-    Route53APIXMLRRSetChangeFooter = """
-       </ChangeBatch>
-      </ChangeResourceRecordSetsRequest>
-    """
+    Route53APIXMLRRSetChangeFooter = \
+        '</ChangeBatch>' \
+        '</ChangeResourceRecordSetsRequest>'
 
     def __init__(self, zonename):
         assert type(zonename) is dns.name.Name, 'zonename is not Name obj'
-        self.additions = []
-        self.deletions = []
+        self.zonename = zonename
+        self.empty_lists()
+
         try:
-            self.zoneid = config.get('hostedzone', zonename.to_text(omit_final_dot=True))
+            self.zoneid = config.get('hostedzone',
+                                    self.zonename.to_text(omit_final_dot=True))
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
-            logging.error('no zoneid for %s' % zonename)
+            logging.error('no zoneid for %s' % self.zonename)
             raise
         else:
-            logging.debug('found %s zoneid: %s' % (zonename, self.zoneid))
+            logging.debug('found %s zoneid: %s' % (self.zonename, self.zoneid))
 
         assert type(self.zoneid) is StringType, 'zoneid is not String obj'
 
 
     def add(self, rrset):
         assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
+        logging.debug('additions: %s' % rrset)
         self.additions.append(rrset)
 
 
     def delete(self, rrset):
         assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
+        logging.debug('deletions: %s' % rrset)
         self.deletions.append(rrset)
+
+
+    def empty_lists(self):
+        self.additions = []
+        self.deletions = []
 
 
     def to_xml(self, comment=None):
         # TODO
         #  Max of 1000 ResourceRecord elements
         #  Max of 32000 characters in record data
-        xml  = """<?xml version="1.0" encoding="UTF-8"?>"""
-        xml += self.Route53APIXMLRRSetChangeHeader
-        xml += '    <Comment>%s</Comment>\n' % comment
-        xml += '        <Changes>'
+        xml  = self.Route53APIXMLRRSetChangeHeader
+        xml += '<Comment>%s</Comment>\n' % comment
+        xml += '<Changes>'
         xml += self.rrset_xml('DELETE', self.deletions)
         xml += self.rrset_xml('CREATE', self.additions)
-        xml += '</Changes>'
+        xml += '\n</Changes>'
         xml += self.Route53APIXMLRRSetChangeFooter
         return xml
 
 
     def rrset_xml(self, action, rrsetlist):
         assert type(action)    is StringType, 'action is not String obj'
-        assert type(rrsetlist) is ListType, 'rrsetlist is not List obj'
-
+        assert type(rrsetlist) is ListType,   'rrsetlist is not List obj'
         return ''.join(["""
-         <Change>
-          <Action>%s</Action>
-          <ResourceRecordSet>
-           <Name>%s</Name>
-           <Type>%s</Type>
-           <TTL>%d</TTL>
-           <ResourceRecords>
-            %s
-           </ResourceRecords>
-          </ResourceRecordSet>
-         </Change>
-        """ % (action, r.name, dns.rdatatype.to_text(r.rdtype), r.ttl, \
-                self.rr_xml(r)) for r in rrsetlist])
+        <Change><Action>%s</Action>
+         <ResourceRecordSet>
+          <Name>%s</Name><Type>%s</Type><TTL>%d</TTL>
+          <ResourceRecords>
+           %s
+          </ResourceRecords>
+         </ResourceRecordSet></Change>""" % (action, r.name,
+                                dns.rdatatype.to_text(r.rdtype), r.ttl,
+                                self.rr_xml(r)) for r in rrsetlist])
 
 
     def rr_xml(self, rrset):
         assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
-        return '\n'.join(['<ResourceRecord><Value>%s</Value></ResourceRecord>' \
+        return ''.join(['<ResourceRecord><Value>%s</Value></ResourceRecord>' \
                                 % r for r in rrset])
+
 
     def submit(self, serial=None):
 
@@ -133,19 +137,23 @@ class Route53HostedZoneRequest:
             logging.debug('nothing to do')
             return
 
+        # XXX - use the serial/comment
         xml = self.to_xml()
         logging.debug(xml)
+        self.empty_lists()
+        assert len(self.additions) == 0, 'additions is not empty'
+        assert len(self.deletions) == 0, 'deletions is not empty'
 
         try:
             dryrun = config.getint('server', 'dry-run')
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
-            dryrun = 0
+            dryrun = False
 
         if dryrun:
             logging.debug('Dry-run. No change submitted')
             return
 
-        cnxn = boto.route53.Route53Connection()
+        cnxn   = boto.route53.Route53Connection()
         result = cnxn.change_rrsets(self.zoneid, xml)
         logging.debug(result)
 
@@ -156,8 +164,8 @@ class Route53HostedZoneRequest:
             logging.error('invalid response: %s' % result)
             raise
         else:
-            logging.info('ChangeID: %s Status: %s' % \
-                            (info.get('Id'), info.get('Status')))
+            logging.info('ChangeID: %s Status: %s' % (info.get('Id'),
+                                                      info.get('Status')))
 
 #############################################################################
 
@@ -176,8 +184,6 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             logging.debug('packet: %s' % binascii.hexlify(self.request[0]))
             return
 
-        # XXX
-        #  Check for QR?
         if msg.rcode() != dns.rcode.NOERROR:
             logging.error('RCODE not NOERROR from %s' % remote_ip)
             response = self.formerr(msg)
@@ -188,20 +194,20 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         elif msg.opcode() == dns.opcode.UPDATE:
             response = self.handle_update(msg)
         else:
-            logging.warn('unsupported opcode from %s: %d' % \
-                            (remote_ip, msg.opcode()))
+            logging.warn('unsupported opcode from %s: %d' % (remote_ip, 
+                                                             msg.opcode()))
             response = self.notimp(msg)
 
-        assert type(response) is dns.message.Message, 'response is not Message obj'
+        assert type(response) is dns.message.Message, \
+                                    'response is not Message obj'
         self.request[1].sendto(response.to_wire(), self.client_address)
 
 
     def handle_update(self, msg):
         """Process an update message."""
 
-        remote_ip = self.client_address[0]
-
         assert type(msg) is dns.message.Message, 'msg is not Message obj'
+        remote_ip = self.client_address[0]
 
         try:
             qname, qclass, qtype = self.parse_question(msg)
@@ -209,18 +215,14 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             raise
         except Exception, e:
             logging.warn('UPDATE parse error from %s: %s' % (remote_ip, e))
-            return(self.servfail(msg))
+            return self.servfail(msg)
         else:
-            logging.info('UPDATE from %s: %s %s %s' % (remote_ip, qname, \
-                                    dns.rdataclass.to_text(qclass), \
+            logging.info('UPDATE from %s: %s %s %s' % (remote_ip, qname,
+                                    dns.rdataclass.to_text(qclass),
                                     dns.rdatatype.to_text(qtype)))
 
-        assert type(qname)  is dns.name.Name, 'qname is not Name obj'
-        assert type(qclass) is IntType, 'qclass is not Int obj'
-        assert type(qtype)  is IntType, 'qtype is not Int obj'
-
         if qtype != dns.rdatatype.SOA or qclass != dns.rdataclass.IN:
-            logging.warn('UPDATE invalid question %s' % remote_ip)
+            logging.warn('UPDATE invalid question from %s' % remote_ip)
             return self.formerr(msg)
 
         if len(msg.answer):
@@ -229,73 +231,63 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             return self.servfail(msg)
 
         response = dns.message.make_response(msg)
-        assert type(response) is dns.message.Message, 'response is not Message obj'
+        assert type(response) is dns.message.Message, \
+                                    'response is not Message obj'
+
+        try:
+            APIRequest = Route53HostedZoneRequest(qname)
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            response.set_rcode(dns.rcode.NOTAUTH)
+            return response
 
         if len(msg.authority) == 0:
             logging.debug('nothing to do')
             return response
 
-        Route53Request = Route53HostedZoneRequest(qname)
-
         for rrset in msg.authority:
+            assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
 
             if not rrset.name.is_subdomain(qname):
                 logging.warn('UPDATE NOTZONE from %s: %s' % (remote_ip, e))
                 response.set_rcode(dns.rcode.NOTZONE)
                 return response
 
-            if rrset.rdclass == dns.rdataclass.IN:
-
+            if not rrset.deleting and rrset.rdclass == dns.rdataclass.IN:
                 # addition
                 logging.debug('UPDATE add rrset: %s' % rrset)
-                if rrset.rdtype in (dns.rdatatype.ANY, dns.rdatatype.AXFR, \
-                                    dns.rdatatype.IXFR, dns.rdatatype.MAILA, \
+                if rrset.rdtype in (dns.rdatatype.ANY,  dns.rdatatype.AXFR,
+                                    dns.rdatatype.IXFR, dns.rdatatype.MAILA,
                                     dns.rdatatype.MAILB):
                     logging.error('UPDATE bad rdtype from %s: %s' % \
-                                    (remote_ip, rrset))
+                                                    (remote_ip, rrset))
                     response.set_rcode(dns.rcode.FORMERR)
                     return response
-
-                Route53Request.add(rrset)
-
-            elif rrset.rdclass == dns.rdataclass.ANY:
-
-                # name or rrset deletion
-                if rrset.ttl != 0:
-                    logging.error('UPDATE bad ttl from %s: %s' % \
-                                    (remote_ip, rrset))
-                    response.set_rcode(dns.rcode.FORMERR)
-                    return response
-
-                if rrset.rdtype in (dns.rdatatype.AXFR, dns.rdatatype.IXFR, \
-                                    dns.rdatatype.MAILA, dns.rdatatype.MAILB):
-                    logging.error('UPDATE bad rdtype from %s: %s' % \
-                                    (remote_ip, rrset))
-                    response.set_rcode(dns.rcode.FORMERR)
-                    return response
-
-                if rrset.rdtype == dns.rdatatype.ANY:
-                    logging.warn('UPDATE unsupported delete name: %s' % rrset)
                 else:
-                    logging.warn('UPDATE unsupported delete rrset: %s' % rrset)
+                    APIRequest.add(rrset)
 
-                response.set_rcode(dns.rcode.SERVFAIL)
+            elif rrset.deleting == dns.rdataclass.ANY :
+                # name or rrset deletion
+                if rrset.ttl != 0 or \
+                     rrset.rdtype in (dns.rdatatype.AXFR,  dns.rdatatype.IXFR,
+                                      dns.rdatatype.MAILA, dns.rdatatype.MAILB):
+                    logging.error('UPDATE illegal values from %s: %s' % \
+                                                        (remote_ip, rrset))
+                    response.set_rcode(dns.rcode.FORMERR)
+                    return response
+
+                logging.warn('UPDATE unsupported delete from %s: %s %s' % \
+                                                        (remote_ip, rrset))
+                response.set_rcode(dns.rcode.REFUSED)
                 return response
 
-            elif rrset.rdclass == dns.rdataclass.NONE:
-
+            elif rrset.deleting == dns.rdataclass.NONE:
                 # specific rr deletion
-                if rrset.ttl != 0:
-                    logging.error('UPDATE bad ttl from %s: %s' % \
-                                    (remote_ip, rrset))
-                    response.set_rcode(dns.rcode.FORMERR)
-                    return response
-
-                if rrset.rdtype in (dns.rdatatype.ANY, dns.rdatatype.AXFR, \
-                                    dns.rdatatype.IXFR, dns.rdatatype.MAILA, \
-                                    dns.rdatatype.MAILB):
-                    logging.error('UPDATE bad rdtype from %s: %s' % \
-                                    (remote_ip, rrset))
+                if rrset.ttl != 0 or \
+                    rrset.rdtype in (dns.rdatatype.ANY,  dns.rdatatype.AXFR,
+                                     dns.rdatatype.IXFR, dns.rdatatype.MAILA,
+                                     dns.rdatatype.MAILB):
+                    logging.error('UPDATE illegal values from %s: %s' % \
+                                                        (remote_ip, rrset))
                     response.set_rcode(dns.rcode.FORMERR)
                     return response
 
@@ -309,19 +301,21 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
                     logging.debug('found delete ttl: %d' % rrset.ttl)
 
                 logging.debug('UPDATE delete rr: %s' % rrset)
-                Route53Request.delete(rrset)
+                APIRequest.delete(rrset)
 
             else:
-                logging.warn('UPDATE unknown rr from %s: %s' % (remote_ip, rrset))
+                logging.warn('UPDATE unknown rr from %s: %s' % \
+                                                    (remote_ip, rrset))
                 response.set_rcode(dns.rcode.FORMERR)
                 return response
 
         try:
-            Route53Request.submit(qname)
+            APIRequest.submit()
         except AssertionError:
             raise
         except boto.route53.exception.DNSServerError, e:
-            logging.error('UPDATE API call failed: %s - %s - %s' % (e.code, e.message, str(e)))
+            logging.error('UPDATE API call failed: %s - %s - %s' % \
+                                        (e.code, e.message, str(e)))
             response.set_rcode(dns.rcode.SERVFAIL)
         except Exception, e:
             logging.error('UPDATE API call failed: %s' % e)
@@ -329,15 +323,14 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         else:
             logging.debug('UPDATE successful')
 
-        return(response)
+        return response
 
 
     def handle_notify(self, msg):
         """Process an update message."""
 
-        remote_ip = self.client_address[0]
-
         assert type(msg) is dns.message.Message, 'msg is not Message obj'
+        remote_ip = self.client_address[0]
 
         try:
             qname, qclass, qtype = self.parse_question(msg)
@@ -347,30 +340,40 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             logging.warn('NOTIFY parse error from %s: %s' % (remote_ip, e))
             return self.servfail(msg)
         else:
-            logging.info('NOTIFY from %s: %s %s %s' % (remote_ip, qname, \
-                                    dns.rdataclass.to_text(qclass), \
+            logging.info('NOTIFY from %s: %s %s %s' % (remote_ip, qname,
+                                    dns.rdataclass.to_text(qclass),
                                     dns.rdatatype.to_text(qtype)))
-
-        assert type(qname)  is dns.name.Name, 'qname is not Name obj'
-        assert type(qclass) is IntType, 'qclass is not Int obj'
-        assert type(qtype)  is IntType, 'qtype is not Int obj'
 
         if qtype != dns.rdatatype.SOA or qclass != dns.rdataclass.IN:
             logging.warn('NOTIFY bad qclass/qtype from %s' % remote_ip)
             return self.servfail(msg)
 
         if not (msg.flags & dns.flags.AA):
-            logging.warn('NOTIFY !AA from %s' % remote_ip)
-
-        #
-        # invoke XFRClient()
-        #
+            # BIND 8; how quaint
+            logging.info('NOTIFY !AA from %s' % remote_ip)
 
         # XXX
-        # For now, respond in the affirmative to anything
-        response = dns.message.make_response(msg)
-        response.flags |= dns.flags.AA
-        return response
+        try:
+            xfr = XFRClient(qname, local_serial=1)
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            # handled in XFRClient
+            pass
+        except (dns.exception.BadResponse, dns.exception.UnexpectedSource):
+            # handled in XFRClient
+            pass
+        except Exception, e:
+            logging.error('XFRClient unhandled init exception: %s' % e)
+            return self.servfail(msg)
+        
+        try:
+            xfr.parse_ixfr()
+        except Exception, e:
+            logging.error('XFRClient unhandled parse exception: %s' % e)
+            return self.servfail(msg)
+        else:
+            response = dns.message.make_response(msg)
+            response.flags |= dns.flags.AA
+            return response
 
 
     def handle_query(self, msg):
@@ -379,9 +382,8 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         #
         # Not ready for release yet
         #
-        remote_ip = self.client_address[0]
-
         assert type(msg) is dns.message.Message, 'msg is not Message obj'
+        remote_ip = self.client_address[0]
 
         try:
             qname, qclass, qtype = self.parse_question(msg)
@@ -389,15 +391,11 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             raise
         except Exception, e:
             logging.warn('QUERY parse error from %s: %s' % (remote_ip, e))
-            return(self.servfail(msg))
+            return self.servfail(msg)
         else:
-            logging.info('QUERY from %s: %s %s %s' % (remote_ip, qname, \
-                                    dns.rdataclass.to_text(qclass), \
+            logging.info('QUERY from %s: %s %s %s' % (remote_ip, qname,
+                                    dns.rdataclass.to_text(qclass),
                                     dns.rdatatype.to_text(qtype)))
-
-        assert type(qname)  is dns.name.Name, 'qname is not Name obj'
-        assert type(qclass) is IntType, 'qclass is not Int obj'
-        assert type(qtype)  is IntType, 'qtype is not Int obj'
 
         response = dns.message.make_response(msg)
         return response
@@ -418,6 +416,9 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             logging.error('missing question from %s: %s' % (remote_ip, e))
             raise
         else:
+            assert type(n) is dns.name.Name, 'qname is not Name obj'
+            assert type(c) is IntType, 'qclass is not Int obj'
+            assert type(t) is IntType, 'qtype is not Int obj'
             return (n, c, t)
 
 
@@ -433,13 +434,136 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
 #############################################################################
 
+class XFRClient:
+
+    def __init__(self, zonename, local_serial=1):
+
+        assert type(zonename) is dns.name.Name, 'zonename is not Name obj'
+        self.zonename = zonename
+        self.local_serial = local_serial
+
+        self.remote_serial = None
+        self.masterip = None
+        self.doit = None
+        self.rrsetcount = 0
+        self.markers = 0
+
+        try:
+            self.APIRequest = Route53HostedZoneRequest(self.zonename)
+        except Exception:
+            logging.debug('exception: %s' % e)
+            raise
+
+        try:
+            self.masterip = config.get('slave',
+                                    self.zonename.to_text(omit_final_dot=True))
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            # XXX
+            logging.error('no master ip for %s' % self.zonename)
+            raise
+
+        try:
+            logging.debug('xfr %s %s %d' % (self.masterip, self.zonename,
+                                            self.local_serial))
+            self.msgs = dns.query.xfr(self.masterip, self.zonename,
+                            serial=self.local_serial, relativize=False,
+                            rdtype=dns.rdatatype.IXFR)
+        except (BadResponse, UnexpectedSource), e:
+            logging.error('XFR failed: %s %s' % (self.zonename, e))
+            raise
+
+
+    def parse_soa(self, rrset):
+        assert type(rrset) is dns.rrset.RRset, 'rrset is RRset obj'
+        assert rrset.rdtype == dns.rdatatype.SOA, 'rrset is not SOA RRset'
+        self.markers += 1   # count of ixfr zone increment markers
+        logging.debug('markers: %s serial %d' % (self.markers, rrset[0].serial))
+
+        if self.markers % 2 == 0:
+            # start of an addition block
+            self.doit = self.APIRequest.add
+        else:
+            # start of deletion block
+            self.doit = self.APIRequest.delete
+            if rrset[0].serial != self.local_serial:
+                try:
+                    # XXX - save SOA to RR cache
+                    self.APIRequest.submit(serial=rrset[0].serial)
+                except AssertionError:
+                    raise
+                except boto.route53.exception.DNSServerError, e:
+                    logging.error('XFR API call failed: %s - %s - %s' % \
+                                  (e.code, e.message, str(e)))
+                except Exception, e:
+                    logging.error('XFR API call failed: %s' % e)
+                else:
+                    logging.debug('XFR stage, %s serial %d' % \
+                                    (self.zonename, rrset[0].serial))
+
+            if rrset[0].serial == self.remote_serial:
+                logging.info('XFR successful, %s serial %d' % \
+                                        (self.zonename, rrset[0].serial))
+                raise EndOfDataException
+
+
+    def parse_ixfr(self):
+        try:
+          for msg in self.msgs:
+            for rrset in msg.answer:
+                self.rrsetcount += 1
+                logging.debug('RR %d: %s' % (self.rrsetcount, rrset))
+
+                if self.rrsetcount == 1:
+                    if rrset[0].rdtype != dns.rdatatype.SOA:
+                        logging.error('protocol error: %s' % rrset)
+                        return 1
+                    else:
+                        self.remote_serial = rrset[0].serial
+                        logging.debug('remote_serial: %d' % self.remote_serial)
+                        continue
+
+                if self.rrsetcount == 2:
+                    if rrset[0].rdtype != dns.rdatatype.SOA or \
+                            rrset[0].serial != self.local_serial:
+                        logging.error('protocol error: %s' % rrset)
+                        return 1
+
+                if rrset[0].rdtype == dns.rdatatype.SOA:
+                    try:
+                        self.parse_soa(rrset)
+                    except EndOfDataException:
+                        assert self.rrsetcount == len(msg.answer), \
+                                                        'unprocessed RRs'
+                        return
+
+                assert type(self.doit) is MethodType, 'doit is not method'
+                self.doit(rrset)
+        except dns.exception.FormError, e:
+            logging.error('malformed message: %s' % e)
+            # XXX
+            return 1
+        except socket.error, e:
+            logging.error('Socket error: %s' % e)
+            # XXX
+            return 1
+
+        if self.rrsetcount == 1:
+            # XXX
+            logging.warn('one SOA rr - AXFR fallback')
+
+#############################################################################
+
+class EndOfDataException(Exception):
+    pass
+
+#############################################################################
+
 #
 # __main__
 #
 
 # This is a modified version of _WireReader._get_section from dnspython 1.9.2.
-# It doesn't munge the RR class in Update section RRs and always decodes the
-# RDATA.
+# It fixes one bug and always decodes record RDATA in Update messages.
 def _get_section(self, section, count):
     """Read the next I{count} records from the wire data and add them to
     the specified section.
@@ -512,16 +636,17 @@ def _get_section(self, section, count):
                (rdclass == dns.rdataclass.ANY or
                 rdclass == dns.rdataclass.NONE):
                 deleting = rdclass
-                #rdclass = self.zone_rdclass
+                rdclass = self.zone_rdclass
             else:
                 deleting = None
 
             rd = dns.rdata.from_wire(rdclass, rdtype, self.wire,
                                      self.current, rdlen,
                                      self.message.origin)
+
             if deleting == dns.rdataclass.ANY or \
                (deleting == dns.rdataclass.NONE and \
-                section == self.message.answer):
+                section is self.message.answer):
                 covers = dns.rdatatype.NONE
             else:
                 covers = rd.covers()
@@ -598,7 +723,8 @@ def drop_privs():
         logging.shutdown()
         sys.exit(1)
     else:
-        logging.debug('user: %s uid: %d gid: %d' % (username, user.pw_uid, user.pw_gid))
+        logging.debug('user: %s uid: %d gid: %d' % (username, user.pw_uid,
+                                                    user.pw_gid))
 
     if user.pw_uid == 0:
         logging.error('cannot drop privs to UID 0')
@@ -649,18 +775,21 @@ def parse_config(file):
         config.readfp(open(file))
     except Exception, e:
         print('error parsing %s config file: %s' % (file, e))
-        logging.shutdown()
+        sys.stdout.flush()
+        sys.stderr.flush()
         sys.exit(1)
 
 
 def setup_logging(debug):
+    """Configure logging module parameters."""
 
     datefmt='%Y-%m-%d %H:%M.%S %Z'
     if debug:
-        logging.basicConfig(level=logging.DEBUG, datefmt=datefmt, \
-            format='%(asctime)s - %(process)d - %(levelname)s - %(filename)s:%(lineno)d %(funcName)s - %(message)s')
+        logging.basicConfig(level=logging.DEBUG, datefmt=datefmt,
+            format='%(asctime)s - %(process)d - %(levelname)s - ' \
+                   '%(filename)s:%(lineno)d %(funcName)s - %(message)s')
     else:
-        logging.basicConfig(level=logging.INFO, datefmt=datefmt, \
+        logging.basicConfig(level=logging.INFO, datefmt=datefmt,
             format='%(asctime)s - %(process)d - %(levelname)s - %(message)s')
 
 
@@ -672,15 +801,14 @@ def worker(server):
 
     """
 
+    logging.debug('Starting')
     while 1:
         try:
-            logging.debug('Starting worker')
             server.serve_forever()
         except select.error:
             # ignore the interrupted syscall spew if we catch a signal
             pass
         except KeyboardInterrupt:
-            logging.info('Exiting.')
             break
         except AssertionError:
             raise
@@ -688,6 +816,7 @@ def worker(server):
             logging.error('Exiting. Caught exception %s' % e)
             return 1
 
+    logging.info('Exiting.')
     return 0
 
 
