@@ -190,11 +190,12 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         elif msg.opcode() == dns.opcode.QUERY:
             response = self.handle_query(msg)
         elif msg.opcode() == dns.opcode.NOTIFY:
-            response = self.handle_notify(msg)
+            self.handle_notify(msg)
+            return
         elif msg.opcode() == dns.opcode.UPDATE:
             response = self.handle_update(msg)
         else:
-            logging.warn('unsupported opcode from %s: %d' % (remote_ip, 
+            logging.warn('unsupported opcode from %s: %d' % (remote_ip,
                                                              msg.opcode()))
             response = self.notimp(msg)
 
@@ -352,7 +353,11 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             # BIND 8; how quaint
             logging.info('NOTIFY !AA from %s' % remote_ip)
 
-        # XXX
+        # Asynchronous reply
+        response = dns.message.make_response(msg)
+        response.flags |= dns.flags.AA
+        self.request[1].sendto(response.to_wire(), self.client_address)
+
         try:
             xfr = XFRClient(qname)
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
@@ -364,16 +369,13 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         except Exception, e:
             logging.error('XFRClient unhandled init exception: %s' % e)
             return self.servfail(msg)
-        
+
         try:
             xfr.parse_ixfr()
         except Exception, e:
             logging.error('XFRClient unhandled parse exception: %s' % e)
-            return self.servfail(msg)
-        else:
-            response = dns.message.make_response(msg)
-            response.flags |= dns.flags.AA
-            return response
+
+        return
 
 
     def handle_query(self, msg):
@@ -469,7 +471,7 @@ class XFRClient:
             r = result.get('ListResourceRecordSetsResponse').get('ResourceRecordSets')[0]
             if r.get('Type') == 'SOA':
                 z = r.get('ResourceRecords').get('ResourceRecord')
-                rrset = dns.rrset.from_text(zonename, r.get('TTL'), 
+                rrset = dns.rrset.from_text(zonename, r.get('TTL'),
                                 dns.rdataclass.IN, dns.rdatatype.SOA,
                                 str(z.get('Value')))
                 break
@@ -589,7 +591,7 @@ def get_rrsets(self, hosted_zone_id, rrname=None, rrtype=None, maxitems=None):
     """
     Retrieve the Resource Record Sets defined for this Hosted Zone.
     Returns a JSON structure representing data returned by the Route53 call.
-    
+
     :type hosted_zone_id: str
     :param hosted_zone_id: The unique identifier for the Hosted Zone
     :type rrname: str
@@ -622,7 +624,7 @@ def get_rrsets(self, hosted_zone_id, rrname=None, rrtype=None, maxitems=None):
         body = response.read()
         boto.log.debug(body)
         if response.status >= 300:
-            raise exception.DNSServerError(response.status, 
+            raise exception.DNSServerError(response.status,
                                             response.reason, body)
 
         e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
