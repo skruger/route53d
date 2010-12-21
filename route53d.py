@@ -354,11 +354,11 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
         # XXX
         try:
-            xfr = XFRClient(qname, local_serial=1)
+            xfr = XFRClient(qname)
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
             # handled in XFRClient
             pass
-        except (dns.exception.BadResponse, dns.exception.UnexpectedSource):
+        except (dns.query.BadResponse, dns.query.UnexpectedSource):
             # handled in XFRClient
             pass
         except Exception, e:
@@ -436,12 +436,11 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
 class XFRClient:
 
-    def __init__(self, zonename, local_serial=1):
+    def __init__(self, zonename):
 
         assert type(zonename) is dns.name.Name, 'zonename is not Name obj'
         self.zonename = zonename
-        self.local_serial = local_serial
-
+        self.local_serial = None
         self.remote_serial = None
         self.masterip = None
         self.doit = None
@@ -453,6 +452,30 @@ class XFRClient:
         except Exception:
             logging.debug('exception: %s' % e)
             raise
+
+        try:
+            zoneid = config.get('hostedzone',
+                                    zonename.to_text(omit_final_dot=True))
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            logging.error('no zoneid for %s' % zonename)
+            raise
+        else:
+            logging.debug('found %s zoneid: %s' % (zonename, zoneid))
+
+        cnxn = boto.route53.Route53Connection()
+        for result in cnxn.get_rrsets(zoneid, rrtype='SOA', maxitems=1,
+                                rrname=zonename.to_text(omit_final_dot=True)):
+            logging.debug(result)
+            r = result.get('ListResourceRecordSetsResponse').get('ResourceRecordSets')[0]
+            if r.get('Type') == 'SOA':
+                z = r.get('ResourceRecords').get('ResourceRecord')
+                rrset = dns.rrset.from_text(zonename, r.get('TTL'), 
+                                dns.rdataclass.IN, dns.rdatatype.SOA,
+                                str(z.get('Value')))
+                break
+
+        logging.info('API serial for %s: %s' % (zonename, rrset[0].serial))
+        self.local_serial = rrset[0].serial
 
         try:
             self.masterip = config.get('slave',
@@ -468,7 +491,7 @@ class XFRClient:
             self.msgs = dns.query.xfr(self.masterip, self.zonename,
                             serial=self.local_serial, relativize=False,
                             rdtype=dns.rdatatype.IXFR)
-        except (BadResponse, UnexpectedSource), e:
+        except (dns.query.BadResponse, dns.query.UnexpectedSource), e:
             logging.error('XFR failed: %s %s' % (self.zonename, e))
             raise
 
@@ -561,6 +584,65 @@ class EndOfDataException(Exception):
 #
 # __main__
 #
+
+def get_rrsets(self, hosted_zone_id, rrname=None, rrtype=None, maxitems=None):
+    """
+    Retrieve the Resource Record Sets defined for this Hosted Zone.
+    Returns a JSON structure representing data returned by the Route53 call.
+    
+    :type hosted_zone_id: str
+    :param hosted_zone_id: The unique identifier for the Hosted Zone
+    :type rrname: str
+    :param rrname: The resource record name to start the results at.
+    :type rrtype: str
+    :param rrtype: The resource record type to start the results at.
+    :type maxitems: int
+    :param maxitems: The maximum number of results to return in one call
+
+    """
+
+    isTruncated = True
+
+    while isTruncated:
+        uri = '/%s/hostedzone/%s/rrset' % (self.Version, hosted_zone_id)
+
+        args = ''
+        if rrname:
+            args += 'name=' + rrname
+        if rrtype:
+            if args: args += '&'
+            args += 'type=' + rrtype
+        if maxitems:
+            if args: args += '&'
+            args += 'maxitems=' + str(maxitems)
+        if args:
+            uri += '?' + args
+
+        response = self.make_request('GET', uri)
+        body = response.read()
+        boto.log.debug(body)
+        if response.status >= 300:
+            raise exception.DNSServerError(response.status, 
+                                            response.reason, body)
+
+        e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
+                                      item_marker=('ResourceRecordSet',))
+        h = boto.jsonresponse.XmlHandler(e, None)
+        h.parse(body)
+        r = e.get('ListResourceRecordSetsResponse')
+        if r.get('IsTruncated') == 'false':
+            isTruncated = False
+        else:
+            isTruncated = True
+            rrname = r.get('NextRecordName').rstrip('.')
+            rrtype = r.get('NextRecordType')
+
+        yield e
+
+    return
+
+boto.route53.Route53Connection.get_rrsets = get_rrsets
+
 
 # This is a modified version of _WireReader._get_section from dnspython 1.9.2.
 # It fixes one bug and always decodes record RDATA in Update messages.
