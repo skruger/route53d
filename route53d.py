@@ -315,8 +315,8 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         except AssertionError:
             raise
         except boto.route53.exception.DNSServerError, e:
-            logging.error('UPDATE API call failed: %s - %s - %s' % \
-                                        (e.code, e.message, str(e)))
+            logging.error('UPDATE API call failed: %s - %s' % \
+                                        (e.code, str(e)))
             response.set_rcode(dns.rcode.SERVFAIL)
         except Exception, e:
             logging.error('UPDATE API call failed: %s' % e)
@@ -362,13 +362,13 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             xfr = XFRClient(qname)
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
             # handled in XFRClient
-            pass
+            return
         except (dns.query.BadResponse, dns.query.UnexpectedSource):
             # handled in XFRClient
-            pass
+            return
         except Exception, e:
             logging.error('XFRClient unhandled init exception: %s' % e)
-            return self.servfail(msg)
+            return
 
         try:
             xfr.parse_ixfr()
@@ -436,7 +436,7 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
 #############################################################################
 
-class XFRClient:
+class XFRClient(object):
 
     def __init__(self, zonename):
 
@@ -517,10 +517,12 @@ class XFRClient:
                 except AssertionError:
                     raise
                 except boto.route53.exception.DNSServerError, e:
-                    logging.error('XFR API call failed: %s - %s - %s' % \
-                                  (e.code, e.message, str(e)))
+                    logging.error('XFR API call failed: %s - %s' % \
+                                  (e.code, str(e)))
+                    raise
                 except Exception, e:
                     logging.error('XFR API call failed: %s' % e)
+                    raise
                 else:
                     logging.debug('XFR stage, %s serial %d' % \
                                     (self.zonename, rrset[0].serial))
@@ -541,7 +543,7 @@ class XFRClient:
                 if self.rrsetcount == 1:
                     if rrset[0].rdtype != dns.rdatatype.SOA:
                         logging.error('protocol error: %s' % rrset)
-                        return 1
+                        return
                     else:
                         self.remote_serial = rrset[0].serial
                         logging.debug('remote_serial: %d' % self.remote_serial)
@@ -551,7 +553,7 @@ class XFRClient:
                     if rrset[0].rdtype != dns.rdatatype.SOA or \
                             rrset[0].serial != self.local_serial:
                         logging.error('protocol error: %s' % rrset)
-                        return 1
+                        return
 
                 if rrset[0].rdtype == dns.rdatatype.SOA:
                     try:
@@ -560,20 +562,24 @@ class XFRClient:
                         assert self.rrsetcount == len(msg.answer), \
                                                         'unprocessed RRs'
                         return
+                    except boto.route53.exception.DNSServerError:
+                        return
+                    except Exception:
+                        raise
 
                 assert type(self.doit) is MethodType, 'doit is not method'
                 self.doit(rrset)
         except dns.exception.FormError, e:
             logging.error('malformed message: %s' % e)
             # XXX
-            return 1
+            return
         except socket.error, e:
             logging.error('Socket error: %s' % e)
             # XXX
-            return 1
+            return
 
         if self.rrsetcount == 1:
-            # XXX
+            # XXX  remote_serial == local_serial means no update needed
             logging.warn('one SOA rr - AXFR fallback')
 
 #############################################################################
@@ -636,7 +642,7 @@ def get_rrsets(self, hosted_zone_id, rrname=None, rrtype=None, maxitems=None):
             isTruncated = False
         else:
             isTruncated = True
-            rrname = r.get('NextRecordName').rstrip('.')
+            rrname = r.get('NextRecordName')
             rrtype = r.get('NextRecordType')
 
         yield e
