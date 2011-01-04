@@ -465,7 +465,7 @@ class XFRClient(object):
             logging.debug('found %s zoneid: %s' % (zonename, zoneid))
 
         cnxn = boto.route53.Route53Connection()
-        for result in cnxn.get_rrsets(zoneid, rrtype='SOA', maxitems=1,
+        for result in self.get_rrsets(zoneid, rrtype='SOA', maxitems=1,
                                 rrname=zonename.to_text(omit_final_dot=True)):
             logging.debug(result)
             r = result.get('ListResourceRecordSetsResponse').get('ResourceRecordSets')[0]
@@ -582,6 +582,36 @@ class XFRClient(object):
             # XXX  remote_serial == local_serial means no update needed
             logging.warn('one SOA rr - AXFR fallback')
 
+
+    def get_rrsets(self, zoneid, rrname=None, rrtype=None, maxitems=None):
+        """
+        Retrieve the Resource Record Sets defined for this Hosted Zone.
+        Returns a JSON structure representing data returned by the Route53 call.
+
+        """
+
+        isTruncated = True
+
+        while isTruncated:
+            body = get_all_rrsets(zoneid, type=rrtype, name=rrname,
+                                  maxitems=maxitems)
+
+            e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
+                                          item_marker=('ResourceRecordSet',))
+            h = boto.jsonresponse.XmlHandler(e, None)
+            h.parse(body)
+            r = e.get('ListResourceRecordSetsResponse')
+            if r.get('IsTruncated') == 'false':
+                isTruncated = False
+            else:
+                isTruncated = True
+                rrname = r.get('NextRecordName')
+                rrtype = r.get('NextRecordType')
+
+            yield e
+
+        return
+
 #############################################################################
 
 class EndOfDataException(Exception):
@@ -592,64 +622,6 @@ class EndOfDataException(Exception):
 #
 # __main__
 #
-
-def get_rrsets(self, hosted_zone_id, rrname=None, rrtype=None, maxitems=None):
-    """
-    Retrieve the Resource Record Sets defined for this Hosted Zone.
-    Returns a JSON structure representing data returned by the Route53 call.
-
-    :type hosted_zone_id: str
-    :param hosted_zone_id: The unique identifier for the Hosted Zone
-    :type rrname: str
-    :param rrname: The resource record name to start the results at.
-    :type rrtype: str
-    :param rrtype: The resource record type to start the results at.
-    :type maxitems: int
-    :param maxitems: The maximum number of results to return in one call
-
-    """
-
-    isTruncated = True
-
-    while isTruncated:
-        uri = '/%s/hostedzone/%s/rrset' % (self.Version, hosted_zone_id)
-
-        args = ''
-        if rrname:
-            args += 'name=' + rrname
-        if rrtype:
-            if args: args += '&'
-            args += 'type=' + rrtype
-        if maxitems:
-            if args: args += '&'
-            args += 'maxitems=' + str(maxitems)
-        if args:
-            uri += '?' + args
-
-        response = self.make_request('GET', uri)
-        body = response.read()
-        boto.log.debug(body)
-        if response.status >= 300:
-            raise exception.DNSServerError(response.status,
-                                            response.reason, body)
-
-        e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
-                                      item_marker=('ResourceRecordSet',))
-        h = boto.jsonresponse.XmlHandler(e, None)
-        h.parse(body)
-        r = e.get('ListResourceRecordSetsResponse')
-        if r.get('IsTruncated') == 'false':
-            isTruncated = False
-        else:
-            isTruncated = True
-            rrname = r.get('NextRecordName')
-            rrtype = r.get('NextRecordType')
-
-        yield e
-
-    return
-
-boto.route53.Route53Connection.get_rrsets = get_rrsets
 
 
 # This is a modified version of _WireReader._get_section from dnspython 1.9.2.
