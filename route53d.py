@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 #
-# Copyright (c) 2010 James Raftery <james@now.ie>
+# Copyright (c) 2010-2011 James Raftery <james@now.ie>
 # All rights reserved.
 # $Id$
 #
