@@ -40,8 +40,10 @@ import SocketServer
 import ConfigParser
 import binascii
 import struct
+import time
 from optparse import OptionParser
-from multiprocessing import Process
+from multiprocessing import Process, Queue
+from Queue import Empty, Full
 from types import *
 import dns.message
 import dns.query
@@ -164,8 +166,16 @@ class Route53HostedZoneRequest(object):
             logging.error('invalid response: %s' % result)
             raise
         else:
-            logging.info('ChangeID: %s Status: %s' % (info.get('Id'),
-                                                      info.get('Status')))
+            id = info.get('Id').lstrip('/change/')
+            status = info.get('Status')
+            logging.info('ChangeID: %s Status: %s' % (id, status))
+            if status == 'PENDING':
+                global q
+                try:
+                    q.put(id)
+                except Full:
+                    logging.warn('status poller queue full, '
+                                 'discarding change %s' % id)
 
 #############################################################################
 
@@ -863,8 +873,8 @@ def worker(server):
 
     """
 
-    logging.debug('Starting')
-    while 1:
+    logging.debug('Starting worker')
+    while True:
         try:
             server.serve_forever()
         except select.error:
@@ -882,6 +892,46 @@ def worker(server):
     return 0
 
 
+def status_poller():
+    """Take change IDs from the global queue and poll the API for them until
+       they're INSYNC
+
+    """
+
+    logging.debug('Starting status poller')
+    cnxn = boto.route53.Route53Connection()
+
+    while True:
+        try:
+            id = q.get_nowait()
+        except Empty:
+            logging.debug('queue is empty')
+        else:
+            # XXX catch exceptions!
+            result = cnxn.get_change(id)
+            logging.debug(result)
+
+            try:
+                info = result.get('GetChangeResponse').get('ChangeInfo')
+            except KeyError:
+                # XXX need to parse error response
+                logging.error('invalid response: %s' % result)
+                raise
+            else:
+                status = info.get('Status')
+                logging.info('ChangeID: %s Status: %s' % (id, status))
+                if status == 'PENDING':
+                    try:
+                        q.put(id)
+                    except Full:
+                        logging.warn('status poller queue full, '
+                                     'discarding change %s' % id)
+        finally:
+            time.sleep(2)
+
+    return
+
+
 def main():
     """Run the show."""
 
@@ -893,16 +943,25 @@ def main():
     server = bind_socket()
     drop_privs()
 
+    global q
+    q = Queue()
+
     # Fire up worker processes
     try:
-        for i in range(config.getint('server','processes')-1):
+        for i in range(config.getint('server','processes')):
             Process(target=worker, args=(server,)).start()
     except (ConfigParser.NoSectionError, ConfigParser.NoOptionError), e:
         logging.error('config error: %s' % e)
         return 1
 
-    # The parent becomes a worker too
-    return worker(server)
+    # Parent polls for pending changes
+    try:
+        status_poller()
+    except AssertionError:
+        raise
+    except Exception, e:
+        logging.error('Exiting. Caught exception %s' % e)
+        return 1
 
 
     #####   #   #   #   #   #   #   #   #   #   #   #   #   #   #   #####
