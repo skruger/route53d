@@ -23,11 +23,11 @@ username = some_user
 
 [kludge]
 # Ugly kludge alert!
-# A dynamic update DNS message specifying a record deletion does not include the
-# record TTL, but that's required for the DELETE API Change request. I have a plan
-# for a workaround but in the meantime the TTL in DELETE calls will be set to this
-# value. Set this to the TTL value you use when you create your records or the DELETE
-# calls will fail.
+# A dynamic update DNS message specifying a record deletion does not include
+# the record TTL, but that's required for the DELETE API Change request. I
+# have a plan for a workaround but in the meantime the TTL in DELETE calls
+# will be set to this value. Set this to the TTL value you use when you
+# create your records or the DELETE calls will fail.
 delete_ttl = 900
 
 
