@@ -48,6 +48,7 @@ from types import *
 import dns.message
 import dns.query
 import dns.rdatatype
+import dns.tsigkeyring
 import boto.route53
 
 #############################################################################
@@ -187,30 +188,54 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
         remote_ip = self.client_address[0]
 
+        kr = TSIGKeyRing(remote_ip)
+
         try:
-            msg = dns.message.from_wire(self.request[0])
+            msg = dns.message.from_wire(self.request[0], keyring=kr.keyring)
+        except dns.message.BadTSIG, e:
+            logging.warn('TSIG error from %s: %s' % (remote_ip, e))
+            response = self.formerr(self.get_question(self.request[0]))
+        except dns.message.UnknownTSIGKey, e:
+            logging.warn('TSIG unknown key from %s: %s' % (remote_ip, e))
+            response = self.notauth(self.get_question(self.request[0]))
+        except dns.tsig.BadSignature, e:
+            logging.warn('TSIG bad signature from %s: %s' % (remote_ip, e))
+            response = self.notauth(self.get_question(self.request[0]))
+        except dns.tsig.BadTime, e:
+            logging.warn('TSIG bad time from %s: %s' % (remote_ip, e))
+            response = self.notauth(self.get_question(self.request[0]))
         except Exception, e:
             logging.error('malformed message from %s: %s' % (remote_ip, e))
             logging.debug('packet: %s' % binascii.hexlify(self.request[0]))
             return
-
-        if msg.rcode() != dns.rcode.NOERROR:
-            logging.error('RCODE not NOERROR from %s' % remote_ip)
-            response = self.formerr(msg)
-        elif msg.opcode() == dns.opcode.QUERY:
-            response = self.handle_query(msg)
-        elif msg.opcode() == dns.opcode.NOTIFY:
-            self.handle_notify(msg)
-            return
-        elif msg.opcode() == dns.opcode.UPDATE:
-            response = self.handle_update(msg)
         else:
-            logging.warn('unsupported opcode from %s: %d' % (remote_ip,
-                                                             msg.opcode()))
-            response = self.notimp(msg)
+            if kr.keyring and not msg.had_tsig:
+                logging.error('No TSIG from %s' % remote_ip)
+                self.request[1].sendto(self.notauth(msg).to_wire(), self.client_address)
+                return
+
+            if msg.rcode() != dns.rcode.NOERROR:
+                logging.warn('RCODE not NOERROR from %s' % remote_ip)
+                self.request[1].sendto(self.formerr(msg).to_wire(), self.client_address)
+                return
+
+            if msg.opcode() == dns.opcode.QUERY:
+                response = self.handle_query(msg)
+            elif msg.opcode() == dns.opcode.NOTIFY:
+                self.handle_notify(msg)
+                return
+            elif msg.opcode() == dns.opcode.UPDATE:
+                response = self.handle_update(msg)
+            else:
+                logging.warn('unsupported opcode from %s: %d' % (remote_ip,
+                                                                 msg.opcode()))
+                response = self.notimp(msg)
 
         assert type(response) is dns.message.Message, \
                                     'response is not Message obj'
+        if msg.had_tsig:
+            response.use_tsig(keyring=kr.keyring)
+
         self.request[1].sendto(response.to_wire(), self.client_address)
 
 
@@ -241,15 +266,14 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             logging.warn('UPDATE unsupported prereqs from %s' % remote_ip)
             return self.servfail(msg)
 
-        response = dns.message.make_response(msg)
-        assert type(response) is dns.message.Message, \
-                                    'response is not Message obj'
-
         try:
             APIRequest = Route53HostedZoneRequest(qname)
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
-            response.set_rcode(dns.rcode.NOTAUTH)
-            return response
+            return self.notauth(msg)
+
+        response = dns.message.make_response(msg)
+        assert type(response) is dns.message.Message, \
+                                    'response is not Message obj'
 
         if len(msg.authority) == 0:
             logging.debug('nothing to do')
@@ -276,7 +300,7 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
                 else:
                     APIRequest.add(rrset)
 
-            elif rrset.deleting == dns.rdataclass.ANY :
+            elif rrset.deleting == dns.rdataclass.ANY:
                 # name or rrset deletion
                 if rrset.ttl != 0 or \
                      rrset.rdtype in (dns.rdatatype.AXFR,  dns.rdatatype.IXFR,
@@ -385,8 +409,6 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         except Exception, e:
             logging.error('XFRClient unhandled parse exception: %s' % e)
 
-        return
-
 
     def handle_query(self, msg):
         """Process a query message."""
@@ -434,15 +456,58 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             return (n, c, t)
 
 
+    def get_question(self, msg):
+        return dns.message.from_wire(msg, question_only=True)
+
+
     # One-liners for replies with common error rcodes
     def servfail(self, msg):
-        return dns.message.make_response(msg).set_rcode(dns.rcode.SERVFAIL)
+        msg = dns.message.make_response(msg)
+        msg.set_rcode(dns.rcode.SERVFAIL)
+        return msg
 
     def notimp(self, msg):
-        return dns.message.make_response(msg).set_rcode(dns.rcode.NOTIMP)
+        msg = dns.message.make_response(msg)
+        msg.set_rcode(dns.rcode.NOTIMP)
+        return msg
 
     def formerr(self, msg):
-        return dns.message.make_response(msg).set_rcode(dns.rcode.FORMERR)
+        msg = dns.message.make_response(msg)
+        msg.set_rcode(dns.rcode.FORMERR)
+        return msg
+
+    def notauth(self, msg):
+        msg = dns.message.make_response(msg)
+        msg.set_rcode(dns.rcode.NOTAUTH)
+        return msg
+
+#############################################################################
+
+class TSIGKeyRing(object):
+
+    def __init__(self, ip):
+        assert type(ip) is StringType, 'ip is not String obj'
+        self.keyring = None
+        self.keyname = None
+
+        try:
+            self.keyname, self.secret = config.get('tsig', ip).split()
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            logging.debug('no tsig config for %s' % ip)
+            return
+        except ValueError, e:
+            logging.error('invalid tsig config for %s: %s' % (ip, e))
+            return
+        else:
+            logging.debug(self)
+
+        # XXX catch exceptions
+        self.keyring = dns.tsigkeyring.from_text({self.keyname: self.secret})
+        logging.debug('tsig keyring %s' % self.keyring)
+
+
+    def __str__(self):
+        return 'TSIGKeyRing %s %s' % (self.keyname, self.secret)
 
 #############################################################################
 
@@ -466,16 +531,16 @@ class XFRClient(object):
             raise
 
         try:
-            zoneid = config.get('hostedzone',
+            self.zoneid = config.get('hostedzone',
                                     zonename.to_text(omit_final_dot=True))
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
             logging.error('no zoneid for %s' % zonename)
             raise
         else:
-            logging.debug('found %s zoneid: %s' % (zonename, zoneid))
+            logging.debug('found %s zoneid: %s' % (zonename, self.zoneid))
 
-        cnxn = boto.route53.Route53Connection()
-        for result in self.get_rrsets(zoneid, rrtype='SOA', maxitems=1,
+        self.cnxn = boto.route53.Route53Connection()
+        for result in self.get_rrsets(rrtype='SOA', maxitems=1,
                                 rrname=zonename.to_text(omit_final_dot=True)):
             logging.debug(result)
             r = result.get('ListResourceRecordSetsResponse').get('ResourceRecordSets')[0]
@@ -497,12 +562,16 @@ class XFRClient(object):
             logging.error('no master ip for %s' % self.zonename)
             raise
 
+        kr = TSIGKeyRing(self.masterip)
+
         try:
             logging.debug('xfr %s %s %d' % (self.masterip, self.zonename,
                                             self.local_serial))
+            # XXX Argh. xfr() requires a keyname
             self.msgs = dns.query.xfr(self.masterip, self.zonename,
                             serial=self.local_serial, relativize=False,
-                            rdtype=dns.rdatatype.IXFR)
+                            rdtype=dns.rdatatype.IXFR,
+                            keyring=kr.keyring, keyname=kr.keyname)
         except (dns.query.BadResponse, dns.query.UnexpectedSource), e:
             logging.error('XFR failed: %s %s' % (self.zonename, e))
             raise
@@ -580,12 +649,24 @@ class XFRClient(object):
                 assert type(self.doit) is MethodType, 'doit is not method'
                 self.doit(rrset)
         except dns.exception.FormError, e:
-            logging.error('malformed message: %s' % e)
+            logging.error('malformed message from %s: %s' % (self.masterip, e))
             # XXX
             return
         except socket.error, e:
-            logging.error('Socket error: %s' % e)
+            logging.error('socket error from %s: %s' % (self.masterip, e))
             # XXX
+            return
+        except dns.tsig.PeerBadKey, e:
+            logging.error('TSIG bad key from %s: %s' % (self.masterip, e))
+            return
+        except dns.tsig.PeerBadSignature, e:
+            logging.error('TSIG bad sig from %s: %s' % (self.masterip, e))
+            return
+        except dns.tsig.PeerBadTime, e:
+            logging.error('TSIG bad time from %s: %s' % (self.masterip, e))
+            return
+        except dns.tsig.PeerBadTruncation, e:
+            logging.error('TSIG bad truncation from %s: %s' % (self.masterip, e))
             return
 
         if self.rrsetcount == 1:
@@ -593,7 +674,7 @@ class XFRClient(object):
             logging.warn('one SOA rr - AXFR fallback')
 
 
-    def get_rrsets(self, zoneid, rrname=None, rrtype=None, maxitems=None):
+    def get_rrsets(self, rrname=None, rrtype=None, maxitems=None):
         """
         Retrieve the Resource Record Sets defined for this Hosted Zone.
         Returns a JSON structure representing data returned by the Route53 call.
@@ -603,8 +684,8 @@ class XFRClient(object):
         isTruncated = True
 
         while isTruncated:
-            body = get_all_rrsets(zoneid, type=rrtype, name=rrname,
-                                  maxitems=maxitems)
+            body = self.cnxn.get_all_rrsets(self.zoneid, type=rrtype,
+                                            name=rrname, maxitems=maxitems)
 
             e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
                                           item_marker=('ResourceRecordSet',))
@@ -620,11 +701,11 @@ class XFRClient(object):
 
             yield e
 
-        return
 
 #############################################################################
 
 class EndOfDataException(Exception):
+    """Signal that no more zone data is available."""
     pass
 
 #############################################################################
@@ -684,10 +765,10 @@ def _get_section(self, section, count):
                     i == (count - 1)):
                 raise BadTSIG
             if self.message.keyring is None:
-                raise UnknownTSIGKey('got signed message without keyring')
+                raise dns.message.UnknownTSIGKey('got signed message without keyring')
             secret = self.message.keyring.get(absolute_name)
             if secret is None:
-                raise UnknownTSIGKey("key '%s' unknown" % name)
+                raise dns.message.UnknownTSIGKey("key '%s' unknown" % name)
             self.message.tsig_ctx = \
                                   dns.tsig.validate(self.wire,
                                       absolute_name,
@@ -928,8 +1009,6 @@ def status_poller():
                                      'discarding change %s' % id)
         finally:
             time.sleep(2)
-
-    return
 
 
 def main():

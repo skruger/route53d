@@ -39,4 +39,9 @@ delete_ttl = 900
 #    baz.org = Z27HFGY546JU76
 #
 
-
+[tsig]
+#
+# List TSIG shared secrets for remote IP addresses. e.g.
+#    [tsig]
+#    192.0.2.174 = foo.key. AAAABBBBCCCCDDDDEEEE
+#
