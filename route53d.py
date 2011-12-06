@@ -72,7 +72,7 @@ class Route53HostedZoneRequest(object):
 
         try:
             self.zoneid = config.get('hostedzone',
-                                    self.zonename.to_text(omit_final_dot=True))
+                                     self.zonename.to_text(omit_final_dot=True))
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
             logging.error('no zoneid for %s' % self.zonename)
             raise
@@ -1047,9 +1047,11 @@ def main():
 
 
 if __name__ == '__main__':
-    ret = main()
-    logging.shutdown()
-    sys.exit(ret)
+    try:
+        sys.exit(main())
+    finally:
+        logging.shutdown()
+
 
 #
 # EOF
