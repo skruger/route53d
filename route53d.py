@@ -3,7 +3,7 @@
 #
 # Copyright (c) 2010-2011 James Raftery <james@now.ie>
 # All rights reserved.
-# $Id$
+# $Revision$ $Date$
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -50,102 +50,60 @@ import dns.query
 import dns.rdatatype
 import dns.tsigkeyring
 import boto.route53
+import boto.route53.record
 
 #############################################################################
 
 class Route53HostedZoneRequest(object):
 
-    Route53APIXMLRRSetChangeHeader = \
-        '<?xml version="1.0" encoding="UTF-8"?>' \
-        '<ChangeResourceRecordSetsRequest ' \
-        'xmlns="https://route53.amazonaws.com/doc/2010-10-01/">' \
-        '<ChangeBatch>'
-
-    Route53APIXMLRRSetChangeFooter = \
-        '</ChangeBatch>' \
-        '</ChangeResourceRecordSetsRequest>'
-
     def __init__(self, zonename):
         assert type(zonename) is dns.name.Name, 'zonename is not Name obj'
         self.zonename = zonename
-        self.empty_lists()
 
         try:
             self.zoneid = config.get('hostedzone',
-                                     self.zonename.to_text(omit_final_dot=True))
-        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+                                     self.zonename.to_text())
+        except ConfigParser.NoSectionError:
             logging.error('no zoneid for %s' % self.zonename)
             raise
+        except ConfigParser.NoOptionError:
+            try:
+                self.zoneid = config.get('hostedzone',
+                                         self.zonename.to_text(omit_final_dot=True))
+            except ConfigParser.NoOptionError:
+                logging.error('no zoneid for %s' % self.zonename)
+                raise
         else:
             logging.debug('found %s zoneid: %s' % (self.zonename, self.zoneid))
 
         assert type(self.zoneid) is StringType, 'zoneid is not String obj'
+        self.r = boto.route53.record.ResourceRecordSets(hosted_zone_id=self.zoneid)
 
+    # TODO
+    #  Max of 1000 ResourceRecord elements
+    #  Max of 32000 characters in record data
 
     def add(self, rrset):
-        assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
         logging.debug('additions: %s' % rrset)
-        self.additions.append(rrset)
-
+        self._add_change('CREATE', rrset)
 
     def delete(self, rrset):
-        assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
         logging.debug('deletions: %s' % rrset)
-        self.deletions.append(rrset)
+        self._add_change('DELETE', rrset)
 
-
-    def empty_lists(self):
-        self.additions = []
-        self.deletions = []
-
-
-    def to_xml(self, comment=None):
-        # TODO
-        #  Max of 1000 ResourceRecord elements
-        #  Max of 32000 characters in record data
-        xml  = self.Route53APIXMLRRSetChangeHeader
-        xml += '<Comment>%s</Comment>\n' % comment
-        xml += '<Changes>'
-        xml += self.rrset_xml('DELETE', self.deletions)
-        xml += self.rrset_xml('CREATE', self.additions)
-        xml += '\n</Changes>'
-        xml += self.Route53APIXMLRRSetChangeFooter
-        return xml
-
-
-    def rrset_xml(self, action, rrsetlist):
-        assert type(action)    is StringType, 'action is not String obj'
-        assert type(rrsetlist) is ListType,   'rrsetlist is not List obj'
-        return ''.join(["""
-        <Change><Action>%s</Action>
-         <ResourceRecordSet>
-          <Name>%s</Name><Type>%s</Type><TTL>%d</TTL>
-          <ResourceRecords>
-           %s
-          </ResourceRecords>
-         </ResourceRecordSet></Change>""" % (action, r.name,
-                                dns.rdatatype.to_text(r.rdtype), r.ttl,
-                                self.rr_xml(r)) for r in rrsetlist])
-
-
-    def rr_xml(self, rrset):
+    def _add_change(self, action, rrset):
+        if action not in ('CREATE', 'DELETE'):
+            raise RuntimeError()
         assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
-        return ''.join(['<ResourceRecord><Value>%s</Value></ResourceRecord>' \
-                                % r for r in rrset])
-
+        change = self.r.add_change(action, rrset.name,
+                                   dns.rdatatype.to_text(rrset.rdtype),
+                                   rrset.ttl)
+        for rdata in rrset:
+            change.add_value(rdata)
 
     def submit(self, serial=None):
 
-        if not self.additions and not self.deletions:
-            logging.debug('nothing to do')
-            return
-
         # XXX - use the serial/comment
-        xml = self.to_xml()
-        logging.debug(xml)
-        self.empty_lists()
-        assert len(self.additions) == 0, 'additions is not empty'
-        assert len(self.deletions) == 0, 'deletions is not empty'
 
         try:
             dryrun = config.getint('server', 'dry-run')
@@ -156,9 +114,9 @@ class Route53HostedZoneRequest(object):
             logging.debug('Dry-run. No change submitted')
             return
 
-        cnxn   = boto.route53.Route53Connection()
-        result = cnxn.change_rrsets(self.zoneid, xml)
+        result = self.r.commit()
         logging.debug(result)
+        self.r = boto.route53.record.ResourceRecordSets(hosted_zone_id=self.zoneid)
 
         try:
             info = result.get('ChangeResourceRecordSetsResponse').get('ChangeInfo')
@@ -283,7 +241,9 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
             assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
 
             if not rrset.name.is_subdomain(qname):
-                logging.warn('UPDATE NOTZONE from %s: %s' % (remote_ip, e))
+                logging.warn('UPDATE NOTZONE from %s: %s %s' % (remote_ip,
+                                                                qname,
+                                                                rrset.name))
                 response.set_rcode(dns.rcode.NOTZONE)
                 return response
 
@@ -447,7 +407,7 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
                         msg.question[0].rdtype
         except IndexError:
             remote_ip = self.client_address[0]
-            logging.error('missing question from %s: %s' % (remote_ip, e))
+            logging.error('missing question from %s' % remote_ip)
             raise
         else:
             assert type(n) is dns.name.Name, 'qname is not Name obj'
@@ -460,7 +420,7 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
         return dns.message.from_wire(msg, question_only=True)
 
 
-    # One-liners for replies with common error rcodes
+    # (Quasi-) One-liners for replies with common error rcodes
     def servfail(self, msg):
         msg = dns.message.make_response(msg)
         msg.set_rcode(dns.rcode.SERVFAIL)
@@ -526,37 +486,48 @@ class XFRClient(object):
 
         try:
             self.APIRequest = Route53HostedZoneRequest(self.zonename)
-        except Exception:
+        except Exception, e:
             logging.debug('exception: %s' % e)
             raise
 
         try:
             self.zoneid = config.get('hostedzone',
-                                    zonename.to_text(omit_final_dot=True))
-        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+                                     zonename.to_text())
+        except ConfigParser.NoSectionError:
             logging.error('no zoneid for %s' % zonename)
             raise
+        except ConfigParser.NoOptionError:
+            try:
+                self.zoneid = config.get('hostedzone',
+                                         zonename.to_text(omit_final_dot=True))
+            except ConfigParser.NoOptionError:
+                logging.error('no zoneid for %s' % zonename)
+                raise
         else:
             logging.debug('found %s zoneid: %s' % (zonename, self.zoneid))
 
         self.cnxn = boto.route53.Route53Connection()
-        for result in self.get_rrsets(rrtype='SOA', maxitems=1,
-                                rrname=zonename.to_text(omit_final_dot=True)):
-            logging.debug(result)
-            r = result.get('ListResourceRecordSetsResponse').get('ResourceRecordSets')[0]
-            if r.get('Type') == 'SOA':
-                z = r.get('ResourceRecords').get('ResourceRecord')
-                rrset = dns.rrset.from_text(zonename, r.get('TTL'),
-                                dns.rdataclass.IN, dns.rdatatype.SOA,
-                                str(z.get('Value')))
-                break
+        # result is a boto.route53.record.ResourceRecordSets object
+        result = self.cnxn.get_all_rrsets(self.zoneid, type='SOA', maxitems=1,
+                                          name=zonename.to_text())
+        if len(result) != 1:
+            raise RuntimeError('uh-oh')
+
+        # rr is a boto.route53.record.Record object
+        rr = result[0]
+        if rr.type == 'SOA':
+            rrset = dns.rrset.from_text(zonename, rr.ttl,
+                                        dns.rdataclass.IN, dns.rdatatype.SOA,
+                                        str(rr.resource_records[0]))
+        else:
+            raise RuntimeError()
 
         logging.info('API serial for %s: %s' % (zonename, rrset[0].serial))
         self.local_serial = rrset[0].serial
 
         try:
             self.masterip = config.get('slave',
-                                    self.zonename.to_text(omit_final_dot=True))
+                                       self.zonename.to_text())
         except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
             # XXX
             logging.error('no master ip for %s' % self.zonename)
@@ -672,34 +643,6 @@ class XFRClient(object):
         if self.rrsetcount == 1:
             # XXX  remote_serial == local_serial means no update needed
             logging.warn('one SOA rr - AXFR fallback')
-
-
-    def get_rrsets(self, rrname=None, rrtype=None, maxitems=None):
-        """
-        Retrieve the Resource Record Sets defined for this Hosted Zone.
-        Returns a JSON structure representing data returned by the Route53 call.
-
-        """
-
-        isTruncated = True
-
-        while isTruncated:
-            body = self.cnxn.get_all_rrsets(self.zoneid, type=rrtype,
-                                            name=rrname, maxitems=maxitems)
-
-            e = boto.jsonresponse.Element(list_marker='ResourceRecordSets',
-                                          item_marker=('ResourceRecordSet',))
-            h = boto.jsonresponse.XmlHandler(e, None)
-            h.parse(body)
-            r = e.get('ListResourceRecordSetsResponse')
-            if r.get('IsTruncated') == 'false':
-                isTruncated = False
-            else:
-                isTruncated = True
-                rrname = r.get('NextRecordName')
-                rrtype = r.get('NextRecordType')
-
-            yield e
 
 
 #############################################################################
