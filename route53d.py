@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 #
-# Copyright (c) 2010-2011 James Raftery <james@now.ie>
+# Copyright (c) 2010-2012 James Raftery <james@now.ie>
 # All rights reserved.
 # $Revision$ $Date$
 #
@@ -78,28 +78,89 @@ class Route53HostedZoneRequest(object):
 
         assert type(self.zoneid) is StringType, 'zoneid is not String obj'
         self.r = boto.route53.record.ResourceRecordSets(hosted_zone_id=self.zoneid)
+        self.changequeue = dict()
 
     # TODO
     #  Max of 1000 ResourceRecord elements
     #  Max of 32000 characters in record data
+    #
 
     def add(self, rrset):
         logging.debug('additions: %s' % rrset)
-        self._add_change('CREATE', rrset)
+        if dns.rdatatype.is_singleton(rrset.rdtype):
+            self._enqueue_change('CREATE', rrset)
+            return
+
+        current_rrset = self.get_record_set(rrset.name, rrset.rdtype)
+        logging.debug('current set: %s' % current_rrset)
+        if len(current_rrset) == 0:
+            self._enqueue_change('CREATE', rrset)
+            return
+
+        self._enqueue_change('DELETE', current_rrset)
+        current_rrset.union_update(rrset)
+        self._enqueue_change('CREATE', current_rrset)
 
     def delete(self, rrset):
         logging.debug('deletions: %s' % rrset)
-        self._add_change('DELETE', rrset)
+        if dns.rdatatype.is_singleton(rrset.rdtype):
+            self._enqueue_change('DELETE', rrset)
+            return
 
-    def _add_change(self, action, rrset):
+        current_rrset = self.get_record_set(rrset.name, rrset.rdtype)
+        logging.debug('current set: %s' % current_rrset)
+        if len(current_rrset) == 0:
+            # XXX how did this happen?!
+            self._enqueue_change('DELETE', rrset)
+            return
+
+        self._enqueue_change('DELETE', current_rrset)
+        current_rrset.difference_update(rrset)
+        self._enqueue_change('CREATE', current_rrset)
+
+    def _enqueue_change(self, action, rrset):
         if action not in ('CREATE', 'DELETE'):
             raise RuntimeError()
-        assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj'
-        change = self.r.add_change(action, rrset.name,
-                                   dns.rdatatype.to_text(rrset.rdtype),
-                                   rrset.ttl)
+        assert type(rrset) is dns.rrset.RRset, 'rrset is not RRset obj: %s' % type(rrset)
+        logging.debug('%s %s' % (action, rrset))
+
+        try:
+            change = self.changequeue[(rrset.name.to_text().lower(),rrset.rdtype,action)]
+        except KeyError:
+            change = self.r.add_change(action, rrset.name,
+                                       dns.rdatatype.to_text(rrset.rdtype),
+                                       rrset.ttl)
+            self.changequeue[(rrset.name.to_text().lower(),rrset.rdtype,action)] = change
+
         for rdata in rrset:
             change.add_value(rdata)
+
+    def get_record_set(self, qname, qtype):
+
+        if isinstance(qtype, int):
+            qtype = dns.rdatatype.to_text(qtype)
+
+        logging.debug('get %s %s %s %s' % (qname, type(qname), qtype, type(qtype)))
+        cnxn = boto.route53.Route53Connection()
+        # result is a boto.route53.record.ResourceRecordSets object
+        result = cnxn.get_all_rrsets(self.zoneid, type=qtype, name=qname, maxitems=1)
+
+        rdatas = list()
+        # rrset is a boto.route53.record.Record object
+        for rrset in result:
+            logging.debug('got %s %s' % (rrset.name, rrset.type))
+            if rrset.name == qname.to_text() and rrset.type == qtype:
+                logging.debug('populating %s %s' % (rrset.name, rrset.type))
+                for rr in rrset.resource_records:
+                    rdatas.append(str(rr))
+            if result.is_truncated and (result.next_record_name != qname.to_text() \
+                    or result.next.record_type != qtype):
+                break
+
+        logging.debug('%s %s rdatas: %s' % (qname, qtype, ','.join(rdatas)))
+
+        return dns.rrset.from_text_list(qname, int(result[0].ttl),
+                                        dns.rdataclass.IN, qtype, rdatas)
 
     def submit(self, serial=None):
 
@@ -117,6 +178,7 @@ class Route53HostedZoneRequest(object):
         result = self.r.commit()
         logging.debug(result)
         self.r = boto.route53.record.ResourceRecordSets(hosted_zone_id=self.zoneid)
+        self.changequeue = dict()
 
         try:
             info = result.get('ChangeResourceRecordSetsResponse').get('ChangeInfo')
@@ -366,8 +428,8 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
 
         try:
             xfr.parse_ixfr()
-        except Exception, e:
-            logging.error('XFRClient unhandled parse exception: %s' % e)
+        except Exception:
+            logging.exception('XFRClient unhandled parse exception')
 
 
     def handle_query(self, msg):
@@ -992,6 +1054,8 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
+    except KeyboardInterrupt:
+        logging.info('caught Ctrl-C, stopping')
     finally:
         logging.shutdown()
 
