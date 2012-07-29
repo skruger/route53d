@@ -93,30 +93,43 @@ class Route53HostedZoneRequest(object):
 
         current_rrset = self.get_record_set(rrset.name, rrset.rdtype)
         logging.debug('current set: %s' % current_rrset)
-        if len(current_rrset) == 0:
+        if current_rrset is None:
             self._enqueue_change('CREATE', rrset)
             return
 
         self._enqueue_change('DELETE', current_rrset)
         current_rrset.union_update(rrset)
-        self._enqueue_change('CREATE', current_rrset)
+        if len(current_rrset):
+            self._enqueue_change('CREATE', current_rrset)
 
-    def delete(self, rrset):
+    def delete(self, rrset, fix_ttl=False):
         logging.debug('deletions: %s' % rrset)
         if dns.rdatatype.is_singleton(rrset.rdtype):
+            if fix_ttl:
+                # XXX what if not found
+                current_rrset = self.get_record_set(rrset.name, rrset.rdtype)
+                logging.debug('setting TTL: %d' % current_rrset.ttl)
+                rrset.ttl = current_rrset.ttl
             self._enqueue_change('DELETE', rrset)
             return
 
+        # XXX what if not found
         current_rrset = self.get_record_set(rrset.name, rrset.rdtype)
         logging.debug('current set: %s' % current_rrset)
-        if len(current_rrset) == 0:
+
+        if fix_ttl:
+            logging.debug('setting TTL: %d' % current_rrset.ttl)
+            rrset.ttl = current_rrset.ttl
+
+        if current_rrset is None:
             # XXX how did this happen?!
             self._enqueue_change('DELETE', rrset)
             return
 
         self._enqueue_change('DELETE', current_rrset)
         current_rrset.difference_update(rrset)
-        self._enqueue_change('CREATE', current_rrset)
+        if len(current_rrset):
+            self._enqueue_change('CREATE', current_rrset)
 
     def _enqueue_change(self, action, rrset):
         if action not in ('CREATE', 'DELETE'):
@@ -159,8 +172,11 @@ class Route53HostedZoneRequest(object):
 
         logging.debug('%s %s rdatas: %s' % (qname, qtype, ','.join(rdatas)))
 
-        return dns.rrset.from_text_list(qname, int(result[0].ttl),
-                                        dns.rdataclass.IN, qtype, rdatas)
+        if len(rdatas) == 0:
+            return None
+        else:
+            return dns.rrset.from_text_list(qname, int(result[0].ttl),
+                                            dns.rdataclass.IN, qtype, rdatas)
 
     def submit(self, serial=None):
 
@@ -358,7 +374,7 @@ class UDPDNSHandler(SocketServer.BaseRequestHandler):
                     logging.debug('found delete ttl: %d' % rrset.ttl)
 
                 logging.debug('UPDATE delete rr: %s' % rrset)
-                APIRequest.delete(rrset)
+                APIRequest.delete(rrset, fix_ttl=True)
 
             else:
                 logging.warn('UPDATE unknown rr from %s: %s' % \
